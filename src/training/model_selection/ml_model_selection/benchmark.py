@@ -1360,12 +1360,13 @@ def run_benchmark(
                      percent ranges 0-100 within the benchmark phase.
     """
 
-    results = []
+    results: List[Optional[BenchmarkResult]] = []
 
     # Create tasks: (query, model_config) pairs
     # Group by model to minimize model reloading (important for Ollama/local inference)
     tasks = [(q, m) for m in model_configs for q in queries]
     total_tasks = len(tasks)
+    results = [None] * total_tasks
 
     # Group models by endpoint for display
     endpoints = set(m.endpoint for m in model_configs)
@@ -1394,9 +1395,9 @@ def run_benchmark(
         eval_client = eval_config.get_client()
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = {}
+        futures: Dict[Any, Tuple[int, QueryRecord, ModelConfig]] = {}
 
-        for query, model_config in tasks:
+        for idx, (query, model_config) in enumerate(tasks):
             future = executor.submit(
                 benchmark_query,
                 model_config,
@@ -1406,7 +1407,7 @@ def run_benchmark(
                 eval_client,
                 judge_semaphore,
             )
-            futures[future] = (query, model_config)
+            futures[future] = (idx, query, model_config)
 
         # Process results as they complete
         iterator = as_completed(futures)
@@ -1414,10 +1415,10 @@ def run_benchmark(
             iterator = tqdm(iterator, total=total_tasks, desc="Benchmarking")
 
         for future in iterator:
-            query, model_config = futures[future]
+            idx, query, model_config = futures[future]
             try:
                 result = future.result()
-                results.append(result)
+                results[idx] = result
                 completed += 1
 
                 if result.performance == 0.0 and "Error" in result.response:
@@ -1438,7 +1439,8 @@ def run_benchmark(
 
     print(f"\nCompleted: {completed}/{total_tasks} ({failed} errors)")
 
-    return results
+    ordered_results = [r for r in results if r is not None]
+    return ordered_results
 
 
 def _evaluate_existing_record(
@@ -1488,7 +1490,7 @@ def run_evaluation_only(
     print("No model inference requests will be sent in this mode.")
     print()
 
-    results: List[BenchmarkResult] = []
+    results: List[Optional[BenchmarkResult]] = [None] * total_tasks
     completed = 0
     failed = 0
     judge_semaphore: Optional[threading.Semaphore] = None
@@ -1498,16 +1500,16 @@ def run_evaluation_only(
         eval_client = eval_config.get_client()
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = {
-            executor.submit(
+        futures: Dict[Any, int] = {}
+        for idx, record in enumerate(records):
+            future = executor.submit(
                 _evaluate_existing_record,
                 record,
                 eval_config,
                 eval_client,
                 judge_semaphore,
-            ): record
-            for record in records
-        }
+            )
+            futures[future] = idx
 
         iterator = as_completed(futures)
         if progress:
@@ -1515,7 +1517,8 @@ def run_evaluation_only(
 
         for future in iterator:
             try:
-                results.append(future.result())
+                idx = futures[future]
+                results[idx] = future.result()
                 completed += 1
             except Exception as e:
                 failed += 1
@@ -1530,7 +1533,8 @@ def run_evaluation_only(
                 )
 
     print(f"\nCompleted: {completed}/{total_tasks} ({failed} errors)")
-    return results
+    ordered_results = [r for r in results if r is not None]
+    return ordered_results
 
 
 def save_results(results: List[BenchmarkResult], output_path: Path) -> None:
