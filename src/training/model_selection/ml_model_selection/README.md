@@ -249,6 +249,23 @@ General:
 --concurrency       Number of concurrent requests (default: 4)
 --limit             Limit number of queries to process (for testing)
 --no-progress       Disable progress bar
+
+Optional rule + judge evaluation:
+--eval-mode         Evaluation mode: rule_only, judge_only, hybrid (default: rule_only)
+--eval-model        Judge model name (required for judge_only/hybrid)
+--eval-endpoint     Judge endpoint (default: same as --endpoint)
+--eval-api-key      Judge API key (default: EVAL_API_KEY env var)
+--eval-temperature  Judge temperature (default: 0.0)
+--eval-trigger      Hybrid trigger: always, uncertain, by-metric (default: by-metric)
+--eval-fusion       Hybrid fusion: weighted, rule, judge, max, min (default: weighted)
+--eval-alpha        Rule weight in weighted fusion (default: 0.5)
+--eval-uncertain-low  Lower bound for uncertain trigger (default: 0.4)
+--eval-uncertain-high Upper bound for uncertain trigger (default: 0.8)
+--eval-timeout-seconds Judge timeout in seconds (default: 20)
+--eval-concurrency  Judge concurrency limit (default: 2)
+--eval-max-retries  Judge retries after first failure (default: 1)
+--eval-hard-fail    Fail benchmark when judge fails (default: fallback to rule)
+--eval-rubric-version Judge rubric version tag (default: v1)
 ```
 
 **Example with existing training data:**
@@ -260,7 +277,22 @@ python benchmark.py \
   --model-config models.yaml \
   --output benchmark_output.jsonl \
   --limit 500  # Test with 500 queries first
+
+# Hybrid mode example (rule + judge)
+python benchmark.py \
+  --queries existing_training_data.jsonl \
+  --model-config models.yaml \
+  --output benchmark_hybrid_output.jsonl \
+  --eval-mode hybrid \
+  --eval-model gpt-4o-mini \
+  --eval-endpoint https://api.openai.com/v1 \
+  --eval-api-key ${OPENAI_API_KEY} \
+  --eval-trigger by-metric \
+  --eval-fusion weighted \
+  --eval-alpha 0.5
 ```
+
+In rule_only mode (default), benchmark behavior is unchanged. Judge metadata is written to output JSONL fields only when judge_only or hybrid is enabled.
 
 #### Model Config File (models.yaml)
 

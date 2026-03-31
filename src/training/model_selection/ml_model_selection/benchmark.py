@@ -57,6 +57,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -119,6 +120,40 @@ class ModelConfig:
             base_url=self.endpoint,
             api_key=api_key,
             default_headers=default_headers,
+        )
+
+
+@dataclass
+class EvalConfig:
+    """Configuration for optional LLM-as-a-judge evaluation."""
+
+    model: str
+    endpoint: str
+    api_key: Optional[str] = None
+    temperature: float = 0.0
+    timeout_seconds: int = 20
+    concurrency: int = 2
+    max_retries: int = 1
+    hard_fail: bool = False
+    mode: str = "rule_only"  # rule_only | judge_only | hybrid
+    trigger: str = "by-metric"  # always | uncertain | by-metric
+    fusion: str = "weighted"  # weighted | rule | judge | max | min
+    alpha: float = 0.5
+    uncertain_low: float = 0.4
+    uncertain_high: float = 0.8
+    rubric_version: str = "v1"
+
+    def get_client(self) -> OpenAI:
+        """Create OpenAI client for judge model."""
+        api_key = self.api_key or "dummy"
+        if api_key.startswith("${") and api_key.endswith("}"):
+            env_var = api_key[2:-1]
+            api_key = os.environ.get(env_var, "dummy")
+
+        return OpenAI(
+            base_url=self.endpoint,
+            api_key=api_key,
+            timeout=float(self.timeout_seconds),
         )
 
 
@@ -823,10 +858,225 @@ def _evaluate_cem(response: str, ground_truth: str) -> float:
     return 0.0
 
 
+RULE_ONLY_METRICS = {"em_mc", "gsm8k", "math", "code_eval"}
+HYBRID_ELIGIBLE_METRICS = {"cem", "f1_score", "commongen_coverage"}
+
+
+def _normalize_metric(metric: Optional[str]) -> str:
+    return (metric or "cem").strip().lower()
+
+
+def _should_use_judge(
+    eval_config: EvalConfig,
+    metric: Optional[str],
+    rule_score: float,
+) -> bool:
+    """Decide whether to invoke judge in hybrid mode."""
+    if eval_config.mode == "judge_only":
+        return True
+    if eval_config.mode == "rule_only":
+        return False
+
+    if eval_config.trigger == "always":
+        return True
+
+    if eval_config.trigger == "uncertain":
+        return eval_config.uncertain_low <= rule_score <= eval_config.uncertain_high
+
+    metric_name = _normalize_metric(metric)
+    if metric_name in RULE_ONLY_METRICS:
+        return False
+    if metric_name in HYBRID_ELIGIBLE_METRICS:
+        return True
+    # Unknown metrics default to judge-eligible in hybrid mode.
+    return True
+
+
+def _build_judge_prompt(
+    query: str,
+    ground_truth: str,
+    model_response: str,
+    metric: Optional[str],
+    rubric_version: str,
+) -> str:
+    """Build a strict JSON-only grading prompt for the judge model."""
+    metric_name = metric or "cem"
+    return (
+        "You are an objective evaluator. Score the model response against ground truth.\n"
+        "Output STRICT JSON only with this schema:\n"
+        '{"score": <0..1>, "label": "correct|partial|incorrect|unknown", '
+        '"reason": "short reason", "confidence": <0..1>}\n'
+        "No markdown. No extra keys.\n"
+        f"rubric_version={rubric_version}\n"
+        f"metric={metric_name}\n\n"
+        f"query:\n{query}\n\n"
+        f"ground_truth:\n{ground_truth}\n\n"
+        f"model_response:\n{model_response}\n"
+    )
+
+
+def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Extract and parse the first balanced JSON object from text."""
+    # First try direct parse.
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start : i + 1]
+                try:
+                    obj = json.loads(candidate)
+                    return obj if isinstance(obj, dict) else None
+                except Exception:
+                    return None
+    return None
+
+
+def _parse_judge_result(raw_text: str) -> Tuple[Optional[float], Dict[str, Any]]:
+    """Parse judge output and normalize fields into metadata."""
+    metadata: Dict[str, Any] = {
+        "judge_schema_violation": False,
+        "judge_raw": raw_text,
+    }
+
+    payload = _extract_first_json_object(raw_text)
+    if payload is None:
+        metadata["judge_error"] = "judge_output_parse_failed"
+        return None, metadata
+
+    score = payload.get("score")
+    label = payload.get("label", "unknown")
+    reason = payload.get("reason", "")
+    confidence = payload.get("confidence", 0.0)
+
+    try:
+        score = float(score)
+    except Exception:
+        metadata["judge_error"] = "judge_output_invalid_score"
+        return None, metadata
+
+    if score < 0.0 or score > 1.0:
+        metadata["judge_schema_violation"] = True
+        score = min(1.0, max(0.0, score))
+
+    label = str(label).strip().lower()
+    if label not in {"correct", "partial", "incorrect", "unknown"}:
+        metadata["judge_schema_violation"] = True
+        label = "unknown"
+
+    try:
+        confidence = float(confidence)
+    except Exception:
+        metadata["judge_schema_violation"] = True
+        confidence = 0.0
+    confidence = min(1.0, max(0.0, confidence))
+
+    metadata["judge_label"] = label
+    metadata["judge_reason"] = str(reason)[:500]
+    metadata["judge_confidence"] = confidence
+    return score, metadata
+
+
+def _fuse_scores(
+    eval_config: EvalConfig,
+    rule_score: float,
+    judge_score: Optional[float],
+) -> Tuple[float, str]:
+    """Fuse rule and judge scores according to configured strategy."""
+    if judge_score is None:
+        return rule_score, "rule_fallback"
+
+    if eval_config.mode == "judge_only":
+        return judge_score, "judge_only"
+
+    if eval_config.mode == "rule_only":
+        return rule_score, "rule_only"
+
+    if eval_config.fusion == "rule":
+        return rule_score, "rule"
+    if eval_config.fusion == "judge":
+        return judge_score, "judge"
+    if eval_config.fusion == "max":
+        return max(rule_score, judge_score), "max"
+    if eval_config.fusion == "min":
+        return min(rule_score, judge_score), "min"
+
+    # weighted
+    final_score = eval_config.alpha * rule_score + (1.0 - eval_config.alpha) * judge_score
+    return final_score, "weighted"
+
+
+def _evaluate_with_judge(
+    eval_client: OpenAI,
+    eval_config: EvalConfig,
+    query: QueryRecord,
+    response_text: str,
+    judge_semaphore: Optional[threading.Semaphore],
+) -> Tuple[Optional[float], Dict[str, Any]]:
+    """Call judge model and return score plus metadata."""
+    prompt = _build_judge_prompt(
+        query=query.query,
+        ground_truth=query.ground_truth or "",
+        model_response=response_text,
+        metric=query.metric,
+        rubric_version=eval_config.rubric_version,
+    )
+
+    metadata: Dict[str, Any] = {}
+    last_error = None
+    attempts = max(1, eval_config.max_retries + 1)
+
+    for attempt in range(attempts):
+        try:
+            if judge_semaphore is not None:
+                with judge_semaphore:
+                    judge_resp = eval_client.chat.completions.create(
+                        model=eval_config.model,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=256,
+                        temperature=eval_config.temperature,
+                    )
+            else:
+                judge_resp = eval_client.chat.completions.create(
+                    model=eval_config.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=256,
+                    temperature=eval_config.temperature,
+                )
+
+            judge_text = judge_resp.choices[0].message.content or ""
+            judge_score, parse_meta = _parse_judge_result(judge_text)
+            metadata.update(parse_meta)
+            return judge_score, metadata
+        except Exception as e:
+            last_error = str(e)
+            if attempt + 1 >= attempts:
+                break
+
+    metadata["judge_error"] = f"judge_request_failed: {last_error}"
+    return None, metadata
+
+
 def benchmark_query(
     model_config: ModelConfig,
     query: QueryRecord,
     concise: bool = False,
+    eval_config: Optional[EvalConfig] = None,
+    eval_client: Optional[OpenAI] = None,
+    judge_semaphore: Optional[threading.Semaphore] = None,
 ) -> BenchmarkResult:
     """Benchmark a single query against a model."""
 
@@ -863,15 +1113,70 @@ def benchmark_query(
     response_time = end_time - start_time
 
     # Evaluate performance
+    extra_fields = dict(query.extra_fields)
     if success:
-        performance = evaluate_response(
+        rule_score = evaluate_response(
             response_text,
             query.ground_truth,
             query.metric,
             query.choices,
         )
+        performance = rule_score
+
+        # Default metadata values for explainability.
+        extra_fields["evaluation_mode"] = "rule_only"
+        extra_fields["evaluation_method"] = "rule"
+        extra_fields["rule_score"] = rule_score
+        extra_fields["final_score"] = performance
+
+        if eval_config is not None:
+            extra_fields["evaluation_mode"] = eval_config.mode
+            extra_fields["judge_rubric_version"] = eval_config.rubric_version
+
+            judge_score: Optional[float] = None
+            should_judge = query.ground_truth is not None and _should_use_judge(
+                eval_config,
+                query.metric,
+                rule_score,
+            )
+
+            if should_judge:
+                if eval_client is None:
+                    eval_client = eval_config.get_client()
+                judge_score, judge_meta = _evaluate_with_judge(
+                    eval_client=eval_client,
+                    eval_config=eval_config,
+                    query=query,
+                    response_text=response_text,
+                    judge_semaphore=judge_semaphore,
+                )
+                extra_fields.update(judge_meta)
+                if judge_score is None and eval_config.hard_fail:
+                    raise RuntimeError(
+                        extra_fields.get("judge_error", "judge evaluation failed")
+                    )
+
+            final_score, fusion_strategy = _fuse_scores(
+                eval_config,
+                rule_score,
+                judge_score,
+            )
+            performance = final_score
+            extra_fields["final_score"] = final_score
+            extra_fields["fusion_strategy"] = fusion_strategy
+
+            if judge_score is not None:
+                extra_fields["judge_score"] = judge_score
+                extra_fields["evaluation_method"] = (
+                    "judge"
+                    if eval_config.mode == "judge_only"
+                    else "hybrid"
+                )
     else:
         performance = 0.0
+        extra_fields["evaluation_mode"] = "rule_only"
+        extra_fields["evaluation_method"] = "rule"
+        extra_fields["final_score"] = 0.0
 
     return BenchmarkResult(
         query=query.query,
@@ -885,7 +1190,7 @@ def benchmark_query(
         embedding_id=query.embedding_id,
         choices=query.choices,
         category=query.category,  # Preserve category from input
-        extra_fields=query.extra_fields,
+        extra_fields=extra_fields,
     )
 
 
@@ -896,6 +1201,7 @@ def run_benchmark(
     progress: bool = True,
     concise: bool = False,
     on_progress=None,
+    eval_config: Optional[EvalConfig] = None,
 ) -> List[BenchmarkResult]:
     """Run benchmark for all queries against all models.
 
@@ -931,6 +1237,11 @@ def run_benchmark(
 
     completed = 0
     failed = 0
+    judge_semaphore: Optional[threading.Semaphore] = None
+    eval_client: Optional[OpenAI] = None
+    if eval_config is not None and eval_config.mode != "rule_only":
+        judge_semaphore = threading.Semaphore(max(1, eval_config.concurrency))
+        eval_client = eval_config.get_client()
 
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = {}
@@ -941,6 +1252,9 @@ def run_benchmark(
                 model_config,
                 query,
                 concise,
+                eval_config,
+                eval_client,
+                judge_semaphore,
             )
             futures[future] = (query, model_config)
 
@@ -1048,6 +1362,7 @@ def run_benchmark_pipeline(
     limit: int = 0,
     show_progress: bool = True,
     on_progress=None,
+    eval_config: Optional[EvalConfig] = None,
 ) -> List[BenchmarkResult]:
     """
     Run the full benchmark pipeline: load queries -> load models -> benchmark -> save.
@@ -1069,6 +1384,7 @@ def run_benchmark_pipeline(
         limit: Limit number of queries (0 = no limit).
         show_progress: Show progress bar (tqdm).
         on_progress: Optional callback(percent, step, message) for progress.
+        eval_config: Optional configuration for judge-based evaluation.
 
     Returns:
         List of BenchmarkResult objects.
@@ -1144,6 +1460,7 @@ def run_benchmark_pipeline(
         progress=show_progress,
         concise=concise,
         on_progress=benchmark_progress if on_progress else None,
+        eval_config=eval_config,
     )
 
     progress(92, "Saving results", f"Writing {len(results)} results to {output_path}")
@@ -1282,6 +1599,98 @@ After benchmarking, train directly (category is preserved from input):
         action="store_true",
         help="Use concise prompts to get shorter responses (faster inference)",
     )
+    parser.add_argument(
+        "--eval-model",
+        type=str,
+        default="",
+        help="Judge model name for optional LLM-as-a-judge scoring",
+    )
+    parser.add_argument(
+        "--eval-endpoint",
+        type=str,
+        default="",
+        help="Judge API endpoint (defaults to --endpoint when omitted)",
+    )
+    parser.add_argument(
+        "--eval-api-key",
+        type=str,
+        default=os.environ.get("EVAL_API_KEY", ""),
+        help="Judge API key (default: EVAL_API_KEY env var)",
+    )
+    parser.add_argument(
+        "--eval-temperature",
+        type=float,
+        default=0.0,
+        help="Judge generation temperature (default: 0.0)",
+    )
+    parser.add_argument(
+        "--eval-mode",
+        type=str,
+        default="rule_only",
+        choices=["rule_only", "judge_only", "hybrid"],
+        help="Evaluation mode: rule_only, judge_only, hybrid (default: rule_only)",
+    )
+    parser.add_argument(
+        "--eval-trigger",
+        type=str,
+        default="by-metric",
+        choices=["always", "uncertain", "by-metric"],
+        help="When to invoke judge in hybrid mode (default: by-metric)",
+    )
+    parser.add_argument(
+        "--eval-fusion",
+        type=str,
+        default="weighted",
+        choices=["weighted", "rule", "judge", "max", "min"],
+        help="Fusion strategy for hybrid mode (default: weighted)",
+    )
+    parser.add_argument(
+        "--eval-alpha",
+        type=float,
+        default=0.5,
+        help="Weighted fusion alpha for rule score (default: 0.5)",
+    )
+    parser.add_argument(
+        "--eval-uncertain-low",
+        type=float,
+        default=0.4,
+        help="Lower bound for uncertain trigger (default: 0.4)",
+    )
+    parser.add_argument(
+        "--eval-uncertain-high",
+        type=float,
+        default=0.8,
+        help="Upper bound for uncertain trigger (default: 0.8)",
+    )
+    parser.add_argument(
+        "--eval-timeout-seconds",
+        type=int,
+        default=20,
+        help="Judge request timeout in seconds (default: 20)",
+    )
+    parser.add_argument(
+        "--eval-concurrency",
+        type=int,
+        default=2,
+        help="Judge concurrency limit (default: 2)",
+    )
+    parser.add_argument(
+        "--eval-max-retries",
+        type=int,
+        default=1,
+        help="Judge request retries after first failure (default: 1)",
+    )
+    parser.add_argument(
+        "--eval-hard-fail",
+        action="store_true",
+        help="Fail benchmark if judge fails instead of falling back to rule score",
+    )
+    parser.add_argument(
+        "--eval-rubric-version",
+        type=str,
+        default="v1",
+        help="Judge rubric version tag written to output metadata",
+    )
 
     args = parser.parse_args()
 
@@ -1292,6 +1701,40 @@ After benchmarking, train directly (category is preserved from input):
         if not models_list:
             print("Error: No models specified")
             sys.exit(1)
+
+    eval_config: Optional[EvalConfig] = None
+    if args.eval_mode != "rule_only":
+        if not args.eval_model:
+            print("Error: --eval-model is required when --eval-mode is judge_only or hybrid")
+            sys.exit(1)
+        if args.eval_trigger == "uncertain" and (
+            args.eval_uncertain_low >= args.eval_uncertain_high
+        ):
+            print("Error: --eval-uncertain-low must be < --eval-uncertain-high")
+            sys.exit(1)
+        if args.eval_fusion == "weighted" and not (0.0 <= args.eval_alpha <= 1.0):
+            print("Error: --eval-alpha must be within [0, 1]")
+            sys.exit(1)
+
+        eval_config = EvalConfig(
+            model=args.eval_model,
+            endpoint=args.eval_endpoint or args.endpoint,
+            api_key=args.eval_api_key or args.api_key,
+            temperature=args.eval_temperature,
+            timeout_seconds=max(1, args.eval_timeout_seconds),
+            concurrency=max(1, args.eval_concurrency),
+            max_retries=max(0, args.eval_max_retries),
+            hard_fail=args.eval_hard_fail,
+            mode=args.eval_mode,
+            trigger=args.eval_trigger,
+            fusion=args.eval_fusion,
+            alpha=args.eval_alpha,
+            uncertain_low=args.eval_uncertain_low,
+            uncertain_high=args.eval_uncertain_high,
+            rubric_version=args.eval_rubric_version,
+        )
+    elif args.eval_model:
+        print("Warning: --eval-model provided but --eval-mode=rule_only; judge settings are ignored")
 
     try:
         results = run_benchmark_pipeline(
@@ -1307,6 +1750,7 @@ After benchmarking, train directly (category is preserved from input):
             concise=args.concise,
             limit=args.limit or 0,
             show_progress=not args.no_progress,
+            eval_config=eval_config,
         )
     except (FileNotFoundError, ValueError) as e:
         print(f"Error: {e}")
