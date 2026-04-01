@@ -28,7 +28,7 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
-      label: 'Installation',
+      label: 'Quickstart',
       items: [
         'installation/installation',
         'installation/configuration',
@@ -85,6 +85,7 @@ const sidebars: SidebarsConfig = {
                 'tutorials/signal/learned/jailbreak',
                 'tutorials/signal/learned/pii',
                 'tutorials/signal/learned/preference',
+                'tutorials/signal/learned/reask',
                 'tutorials/signal/learned/kb',
                 'tutorials/signal/learned/user-feedback',
               ],
@@ -129,6 +130,7 @@ const sidebars: SidebarsConfig = {
                 'tutorials/algorithm/selection/kmeans',
                 'tutorials/algorithm/selection/knn',
                 'tutorials/algorithm/selection/latency-aware',
+                'tutorials/algorithm/selection/mlp',
                 'tutorials/algorithm/selection/rl-driven',
                 'tutorials/algorithm/selection/router-dc',
                 'tutorials/algorithm/selection/static',

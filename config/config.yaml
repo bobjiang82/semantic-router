@@ -206,6 +206,16 @@ routing:
       - name: need_clarification
         description: The user asks for a clearer or more detailed answer.
 
+    reasks:
+      - name: likely_dissatisfied
+        description: The current user turn closely repeats the immediately previous user turn.
+        threshold: 0.8
+        lookback_turns: 1
+      - name: persistently_dissatisfied
+        description: The current user turn repeats the last two user turns in a row.
+        threshold: 0.8
+        lookback_turns: 2
+
     preferences:
       - name: terse_answers
         description: Users who prefer short, direct responses.
@@ -965,6 +975,26 @@ routing:
               vector_store_id: local-vs
               file_ids: [kb-001, kb-002]
 
+    - name: repeat_question_escalation
+      description: Escalate when the user repeats the same question after an unsatisfying answer.
+      priority: 114
+      rules:
+        operator: AND
+        conditions:
+          - type: reask
+            name: likely_dissatisfied
+      modelRefs:
+        - model: qwen3-32b
+          use_reasoning: true
+      algorithm:
+        type: static
+      plugins:
+        - type: header_mutation
+          configuration:
+            add:
+              - key: x-escalation-reason
+                value: repeated-question
+
     - name: safe_only_svm_route
       description: SVM route that only matches when prompt-injection signals are absent.
       priority: 110
@@ -1504,6 +1534,16 @@ global:
         embedding_model: all-MiniLM-L6-v2
         request_timeout_seconds: 30
         search_type: hybrid
+      valkey:
+        host: valkey
+        port: 6379
+        database: 0
+        password: valkey-secret
+        connect_timeout: 5
+        collection_prefix: "vsr_vs_"
+        metric_type: COSINE
+        index_m: 16
+        index_ef_construction: 200
 
   integrations:
     tools:

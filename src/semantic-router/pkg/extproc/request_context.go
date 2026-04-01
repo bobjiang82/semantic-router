@@ -42,6 +42,8 @@ type RequestContext struct {
 	OriginalRequestBody []byte
 	RequestModel        string
 	RequestQuery        string
+	// CacheQuery is the semantic-cache lookup key (may include user scope); empty means fall back to RequestQuery.
+	CacheQuery          string
 	StartTime           time.Time
 	ProcessingStartTime time.Time
 
@@ -84,6 +86,7 @@ type RequestContext struct {
 	VSRMatchedDomains      []string // Matched domain rule names
 	VSRMatchedFactCheck    []string // Matched fact-check signals
 	VSRMatchedUserFeedback []string // Matched user feedback signals
+	VSRMatchedReask        []string // Matched repeated-question dissatisfaction signals
 	VSRMatchedPreference   []string // Matched preference signals
 	VSRMatchedLanguage     []string // Matched language signals
 	VSRMatchedContext      []string // Matched context rule names (e.g. "low_token_count")
