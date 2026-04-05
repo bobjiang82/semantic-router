@@ -5,7 +5,7 @@ set -euo pipefail
 show_usage() {
     cat <<'EOF'
 Usage:
-  ./scripts/jsonl_numeric_distribution.sh <jsonl-file> <field> [options]
+    ./scripts/jsonl_numeric_distribution.sh <jsonl-file> [field] [options]
 
 Description:
   Read numeric values from a JSONL file and print summary stats, bucket
@@ -13,7 +13,7 @@ Description:
 
 Arguments:
   <jsonl-file>    Path to the input JSONL file
-  <field>         Field name or jq expression, for example:
+    [field]         Field name or jq expression (default: performance), for example:
                   performance
                   score.value
                   .performance
@@ -23,31 +23,36 @@ Options:
   --min VALUE             Histogram lower bound (default: 0)
   --max VALUE             Histogram upper bound (default: 1)
     --split-exact VALUE     Put an exact numeric value in its own bucket
-                                                    Can be repeated, e.g. --split-exact 0 --split-exact 1.0
+                                                    Can be repeated. Defaults: --split-exact 0 --split-exact 1.0
   --no-histogram          Skip text bars and print counts only
   -h, --help              Show this help
 
 Examples:
-  ./scripts/jsonl_numeric_distribution.sh data.jsonl performance
-  ./scripts/jsonl_numeric_distribution.sh data.jsonl performance --split-exact 1.0
-    ./scripts/jsonl_numeric_distribution.sh data.jsonl performance --split-exact 0 --split-exact 1.0
+    ./scripts/jsonl_numeric_distribution.sh data.jsonl
+    ./scripts/jsonl_numeric_distribution.sh data.jsonl performance
+    ./scripts/jsonl_numeric_distribution.sh data.jsonl performance --split-exact 0.5
   ./scripts/jsonl_numeric_distribution.sh data.jsonl score.value --bins 20 --min 0 --max 100
 EOF
 }
 
-if [[ $# -lt 2 ]]; then
+if [[ $# -lt 1 ]]; then
     show_usage
     exit 1
 fi
 
 jsonl_file="$1"
-field_input="$2"
-shift 2
+shift
+
+field_input="performance"
+if [[ $# -gt 0 && "$1" != --* ]]; then
+    field_input="$1"
+    shift
+fi
 
 bins=10
 min_value=0
 max_value=1
-split_exact_values=()
+split_exact_values=("0" "1.0")
 show_histogram=1
 
 while [[ $# -gt 0 ]]; do
@@ -145,6 +150,21 @@ function quantile(values, count, q, q_index) {
     }
     q_index = int(q * (count - 1))
     return values[q_index]
+}
+
+function print_split_bucket(split_key, split_value, pct, bar_len, bar, j) {
+    split_value = split_count[split_key] + 0
+    pct = 100 * split_value / total
+    if (show_histogram && max_bucket_count > 0) {
+        bar_len = int(split_value * 40 / max_bucket_count)
+        bar = ""
+        for (j = 0; j < bar_len; j++) {
+            bar = bar "#"
+        }
+        printf "[%s]%*s %6d %7.2f%% %s\n", split_key, 14 - length(split_key), " ", split_value, pct, bar
+    } else {
+        printf "[%s]%*s %6d %7.2f%%\n", split_key, 14 - length(split_key), " ", split_value, pct
+    }
 }
 
 BEGIN {
@@ -253,6 +273,15 @@ END {
     printf "Out-of-range (<min, >max): %d, %d\n\n", lower_outliers, upper_outliers
 
     print "Bucket distribution:"
+    if (use_split) {
+        for (s = 1; s <= split_order_len; s++) {
+            split_key = split_order[s]
+            if (almost_equal(split_value_num[split_key], min_value)) {
+                print_split_bucket(split_key)
+            }
+        }
+    }
+
     for (i = 0; i < bins; i++) {
         left = min_value + i * (max_value - min_value) / bins
         right = min_value + (i + 1) * (max_value - min_value) / bins
@@ -274,17 +303,15 @@ END {
     if (use_split) {
         for (s = 1; s <= split_order_len; s++) {
             split_key = split_order[s]
-            split_value = split_count[split_key] + 0
-            pct = 100 * split_value / total
-            if (show_histogram && max_bucket_count > 0) {
-                bar_len = int(split_value * 40 / max_bucket_count)
-                bar = ""
-                for (j = 0; j < bar_len; j++) {
-                    bar = bar "#"
-                }
-                printf "[%s]%*s %6d %7.2f%% %s\n", split_key, 14 - length(split_key), " ", split_value, pct, bar
-            } else {
-                printf "[%s]%*s %6d %7.2f%%\n", split_key, 14 - length(split_key), " ", split_value, pct
+            if (!almost_equal(split_value_num[split_key], min_value) && !almost_equal(split_value_num[split_key], max_value)) {
+                print_split_bucket(split_key)
+            }
+        }
+
+        for (s = 1; s <= split_order_len; s++) {
+            split_key = split_order[s]
+            if (!almost_equal(split_value_num[split_key], min_value) && almost_equal(split_value_num[split_key], max_value)) {
+                print_split_bucket(split_key)
             }
         }
     }
