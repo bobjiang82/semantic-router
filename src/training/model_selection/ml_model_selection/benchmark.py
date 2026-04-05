@@ -62,7 +62,7 @@ import re
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -92,6 +92,9 @@ ENABLE_THINKING_FORMAT_CHOICES = {
     ENABLE_THINKING_FORMAT_DIRECT,
     ENABLE_THINKING_FORMAT_CHAT_TEMPLATE_KWARGS,
 }
+DEFAULT_EVAL_TIMEOUT_SECONDS = 60
+ORDERED_WRITE_STALL_GRACE_SECONDS = 5
+JUDGE_TIMEOUT_PLACEHOLDER_REASON = "llm judge timeout"
 
 
 def _normalize_enable_thinking_format(value: Optional[str], context: str) -> str:
@@ -159,11 +162,11 @@ class EvalConfig:
     endpoint: str
     api_key: Optional[str] = None
     temperature: float = 0.0
-    timeout_seconds: int = 20
+    timeout_seconds: int = DEFAULT_EVAL_TIMEOUT_SECONDS
     concurrency: int = 2
     max_retries: int = 1
     hard_fail: bool = False
-    mode: str = "rule_only"  # rule_only | judge_only | hybrid
+    mode: str = "rule_only"  # rule_only | judge_only | hybrid | judge_review
     trigger: str = "by-metric"  # always | uncertain | by-metric
     fusion: str = "weighted"  # weighted | rule | judge | max | min
     alpha: float = 0.5
@@ -591,6 +594,7 @@ def _load_completed_resume_keys(output_path: Optional[Path]) -> Set[str]:
 
     completed: Set[str] = set()
     invalid_lines = 0
+    timeout_placeholders = 0
 
     with open(output_path, "r", encoding="utf-8") as f:
         for line_num, line in enumerate(f, 1):
@@ -609,6 +613,11 @@ def _load_completed_resume_keys(output_path: Optional[Path]) -> Set[str]:
             if query is None or model_name is None:
                 continue
 
+            # Timeout placeholder rows should be retried on resume.
+            if row.get("judge_reason") == JUDGE_TIMEOUT_PLACEHOLDER_REASON:
+                timeout_placeholders += 1
+                continue
+
             completed.add(
                 _build_resume_key(
                     query=str(query),
@@ -625,8 +634,58 @@ def _load_completed_resume_keys(output_path: Optional[Path]) -> Set[str]:
         print(
             f"Warning: Ignored {invalid_lines} invalid JSON lines while loading resume state from {output_path}"
         )
+    if timeout_placeholders:
+        print(
+            f"Info: Found {timeout_placeholders} timeout placeholder rows in {output_path}; they will be re-evaluated."
+        )
 
     return completed
+
+
+def _compact_resume_output(output_path: Optional[Path]) -> None:
+    """Rewrite resume output file without timeout placeholders before appending."""
+
+    if output_path is None or not output_path.exists():
+        return
+
+    retained_lines: List[str] = []
+    removed_timeouts = 0
+    invalid_lines = 0
+
+    with open(output_path, "r", encoding="utf-8") as f:
+        for line in f:
+            text = line.strip()
+            if not text:
+                continue
+
+            try:
+                row = json.loads(text)
+            except json.JSONDecodeError:
+                invalid_lines += 1
+                continue
+
+            if row.get("judge_reason") == JUDGE_TIMEOUT_PLACEHOLDER_REASON:
+                removed_timeouts += 1
+                continue
+
+            retained_lines.append(json.dumps(row))
+
+    if removed_timeouts == 0 and invalid_lines == 0:
+        return
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        for line in retained_lines:
+            f.write(line + "\n")
+
+    print(
+        f"Info: Compacted resume output {output_path}; removed {removed_timeouts} timeout placeholders"
+        + (
+            f" and {invalid_lines} invalid JSON lines"
+            if invalid_lines
+            else ""
+        )
+        + "."
+    )
 
 
 def evaluate_response(
@@ -1118,9 +1177,12 @@ def _should_use_judge(
     metric: Optional[str],
     rule_score: float,
 ) -> bool:
-    """Decide whether to invoke judge in hybrid mode."""
+    """Decide whether to invoke judge based on evaluation mode and trigger."""
     if eval_config.mode == "judge_only":
         return True
+    if eval_config.mode == "judge_review":
+        # Re-evaluate only when rule score is not a perfect hit.
+        return rule_score != 1.0
     if eval_config.mode == "rule_only":
         return False
 
@@ -1249,6 +1311,9 @@ def _fuse_scores(
     if eval_config.mode == "judge_only":
         return judge_score, "judge_only"
 
+    if eval_config.mode == "judge_review":
+        return judge_score, "judge_review"
+
     if eval_config.mode == "rule_only":
         return rule_score, "rule_only"
 
@@ -1285,6 +1350,7 @@ def _evaluate_with_judge(
     metadata: Dict[str, Any] = {}
     last_error = None
     attempts = max(1, eval_config.max_retries + 1)
+    judge_start_time = time.time()
 
     for attempt in range(attempts):
         try:
@@ -1307,6 +1373,7 @@ def _evaluate_with_judge(
             judge_text = judge_resp.choices[0].message.content or ""
             judge_score, parse_meta = _parse_judge_result(judge_text)
             metadata.update(parse_meta)
+            metadata["judge_time"] = time.time() - judge_start_time
             return judge_score, metadata
         except Exception as e:
             last_error = str(e)
@@ -1314,6 +1381,7 @@ def _evaluate_with_judge(
                 break
 
     metadata["judge_error"] = f"judge_request_failed: {last_error}"
+    metadata["judge_time"] = time.time() - judge_start_time
     return None, metadata
 
 
@@ -1345,6 +1413,8 @@ def score_existing_response(
     if eval_config is not None:
         extra_fields["evaluation_mode"] = eval_config.mode
         extra_fields["judge_rubric_version"] = eval_config.rubric_version
+        if eval_config.mode == "judge_review" and rule_score == 1.0:
+            extra_fields["judge_reason"] = "rule_score=1"
 
         judge_score: Optional[float] = None
         should_judge = query.ground_truth is not None and _should_use_judge(
@@ -1380,9 +1450,12 @@ def score_existing_response(
 
         if judge_score is not None:
             extra_fields["judge_score"] = judge_score
-            extra_fields["evaluation_method"] = (
-                "judge" if eval_config.mode == "judge_only" else "hybrid"
-            )
+            if eval_config.mode == "judge_only":
+                extra_fields["evaluation_method"] = "judge"
+            elif eval_config.mode == "judge_review":
+                extra_fields["evaluation_method"] = "judge_review"
+            else:
+                extra_fields["evaluation_method"] = "hybrid"
 
     return performance, extra_fields
 
@@ -1478,6 +1551,73 @@ def benchmark_query(
     )
 
 
+def _build_timeout_placeholder_for_benchmark(
+    query: QueryRecord,
+    model_name: str,
+    evaluation_mode: str,
+) -> BenchmarkResult:
+    """Build ordered-write timeout placeholder while preserving input-row fields."""
+    extra_fields = dict(query.extra_fields)
+    extra_fields["evaluation_mode"] = evaluation_mode
+    extra_fields["evaluation_method"] = "rule"
+    extra_fields["rule_score"] = 0.0
+    extra_fields["final_score"] = 0.0
+    extra_fields["judge_reason"] = JUDGE_TIMEOUT_PLACEHOLDER_REASON
+
+    return BenchmarkResult(
+        query=query.query,
+        model_name=model_name,
+        response=f"Error: {JUDGE_TIMEOUT_PLACEHOLDER_REASON}",
+        performance=0.0,
+        response_time=0.0,
+        ground_truth=query.ground_truth,
+        task_name=query.task_name,
+        metric=query.metric,
+        embedding_id=query.embedding_id,
+        choices=query.choices,
+        category=query.category,
+        extra_fields=extra_fields,
+    )
+
+
+def _build_timeout_placeholder_for_existing_record(
+    record: ExistingResponseRecord,
+    evaluation_mode: str,
+) -> BenchmarkResult:
+    """Build ordered-write timeout placeholder while preserving input-row fields."""
+    query = record.query_record
+    rule_score = evaluate_response(
+        record.response,
+        query.ground_truth,
+        query.metric,
+        query.choices,
+    )
+    extra_fields = dict(query.extra_fields)
+    extra_fields["evaluation_mode"] = evaluation_mode
+    extra_fields["evaluation_method"] = "rule"
+    extra_fields["rule_score"] = rule_score
+    extra_fields["final_score"] = rule_score
+    if evaluation_mode == "judge_review" and rule_score == 1.0:
+        extra_fields["judge_reason"] = "rule_score=1"
+    else:
+        extra_fields["judge_reason"] = JUDGE_TIMEOUT_PLACEHOLDER_REASON
+
+    return BenchmarkResult(
+        query=query.query,
+        model_name=record.model_name,
+        response=record.response,
+        performance=rule_score,
+        response_time=record.response_time,
+        ground_truth=query.ground_truth,
+        task_name=query.task_name,
+        metric=query.metric,
+        embedding_id=query.embedding_id,
+        choices=query.choices,
+        category=query.category,
+        extra_fields=extra_fields,
+    )
+
+
 def run_benchmark(
     queries: List[QueryRecord],
     model_configs: List[ModelConfig],
@@ -1517,6 +1657,7 @@ def run_benchmark(
     completed_resume_keys: Set[str] = set()
     if resume:
         completed_resume_keys = _load_completed_resume_keys(output_path)
+        _compact_resume_output(output_path)
 
     tasks = [
         (q, m, k)
@@ -1553,14 +1694,25 @@ def run_benchmark(
 
     completed = 0
     failed = 0
+    timed_out = 0
     written = 0
     next_to_write = 0
     finished: List[bool] = [False] * total_tasks
+    task_deadlines: List[Optional[float]] = [None] * total_tasks
+    task_contexts: List[Tuple[QueryRecord, str]] = [
+        (query, model_config.name) for query, model_config, _ in tasks
+    ]
     judge_semaphore: Optional[threading.Semaphore] = None
     eval_client: Optional[OpenAI] = None
     if eval_config is not None and eval_config.mode != "rule_only":
         judge_semaphore = threading.Semaphore(max(1, eval_config.concurrency))
         eval_client = eval_config.get_client()
+    evaluation_mode = eval_config.mode if eval_config is not None else "rule_only"
+    ordered_write_timeout_seconds = (
+        eval_config.timeout_seconds
+        if eval_config is not None
+        else DEFAULT_EVAL_TIMEOUT_SECONDS
+    )
 
     output_file = None
     if output_path is not None:
@@ -1572,29 +1724,36 @@ def run_benchmark(
         if total_tasks == 0:
             print("No pending requests. Nothing to run.")
             return []
+        executor = ThreadPoolExecutor(max_workers=concurrency)
+        futures: Dict[Any, Tuple[int, QueryRecord, ModelConfig]] = {}
+        future_by_idx: Dict[int, Any] = {}
 
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures: Dict[Any, Tuple[int, QueryRecord, ModelConfig]] = {}
+        for idx, (query, model_config, _task_key) in enumerate(tasks):
+            future = executor.submit(
+                benchmark_query,
+                model_config,
+                query,
+                concise,
+                eval_config,
+                eval_client,
+                judge_semaphore,
+            )
+            futures[future] = (idx, query, model_config)
+            future_by_idx[idx] = future
+        pending_futures = set(futures.keys())
+        pbar = tqdm(total=total_tasks, desc="Benchmarking") if progress else None
 
-            for idx, (query, model_config, _task_key) in enumerate(tasks):
-                future = executor.submit(
-                    benchmark_query,
-                    model_config,
-                    query,
-                    concise,
-                    eval_config,
-                    eval_client,
-                    judge_semaphore,
-                )
-                futures[future] = (idx, query, model_config)
+        while pending_futures:
+            done, pending_futures = wait(
+                pending_futures,
+                timeout=0.5,
+                return_when=FIRST_COMPLETED,
+            )
 
-            # Process results as they complete
-            iterator = as_completed(futures)
-            if progress:
-                iterator = tqdm(iterator, total=total_tasks, desc="Benchmarking")
-
-            for future in iterator:
+            for future in done:
                 idx, query, model_config = futures[future]
+                if finished[idx]:
+                    continue
                 try:
                     result = future.result()
                     results[idx] = result
@@ -1602,36 +1761,94 @@ def run_benchmark(
 
                     if result.performance == 0.0 and "Error" in result.response:
                         failed += 1
-
-                    # Report per-task progress (scale 0-100 within this function)
-                    if on_progress and total_tasks > 0:
-                        pct = int(completed * 100 / total_tasks)
-                        on_progress(
-                            pct,
-                            "Benchmarking",
-                            f"{completed}/{total_tasks} queries completed ({failed} errors)",
-                        )
-
                 except Exception as e:
                     print(f"\nError processing {model_config.name}: {e}")
                     failed += 1
                 finally:
                     finished[idx] = True
-                    if output_file is not None:
-                        while next_to_write < total_tasks and finished[next_to_write]:
-                            pending_result = results[next_to_write]
-                            if pending_result is not None:
-                                output_file.write(
-                                    json.dumps(pending_result.to_jsonl_dict()) + "\n"
-                                )
-                                output_file.flush()
-                                written += 1
-                            next_to_write += 1
+                    if pbar is not None:
+                        pbar.update(1)
+
+            if output_file is not None:
+                now = time.time()
+                while next_to_write < total_tasks:
+                    if finished[next_to_write]:
+                        task_deadlines[next_to_write] = None
+                        pending_result = results[next_to_write]
+                        if pending_result is None:
+                            query_rec, model_name = task_contexts[next_to_write]
+                            pending_result = _build_timeout_placeholder_for_benchmark(
+                                query_rec,
+                                model_name,
+                                evaluation_mode,
+                            )
+                            results[next_to_write] = pending_result
+                        output_file.write(
+                            json.dumps(pending_result.to_jsonl_dict()) + "\n"
+                        )
+                        output_file.flush()
+                        written += 1
+                        next_to_write += 1
+                        continue
+
+                    if task_deadlines[next_to_write] is None:
+                        task_deadlines[next_to_write] = (
+                            now
+                            + ordered_write_timeout_seconds
+                            + ORDERED_WRITE_STALL_GRACE_SECONDS
+                        )
+                        break
+
+                    if now >= task_deadlines[next_to_write]:
+                        query_rec, model_name = task_contexts[next_to_write]
+                        timeout_result = _build_timeout_placeholder_for_benchmark(
+                            query_rec,
+                            model_name,
+                            evaluation_mode,
+                        )
+                        results[next_to_write] = timeout_result
+                        finished[next_to_write] = True
+                        timed_out += 1
+
+                        timeout_future = future_by_idx.get(next_to_write)
+                        if timeout_future is not None:
+                            pending_futures.discard(timeout_future)
+
+                        if pbar is not None:
+                            pbar.update(1)
+
+                        output_file.write(
+                            json.dumps(timeout_result.to_jsonl_dict()) + "\n"
+                        )
+                        output_file.flush()
+                        written += 1
+                        next_to_write += 1
+                        continue
+
+                    break
+
+            # Report per-task progress (scale 0-100 within this function)
+            if on_progress and total_tasks > 0:
+                pct = int((completed + failed + timed_out) * 100 / total_tasks)
+                on_progress(
+                    pct,
+                    "Benchmarking",
+                    f"{completed + failed + timed_out}/{total_tasks} queries completed "
+                    f"({failed} errors, {timed_out} timeouts)",
+                )
+
+        if pbar is not None:
+            pbar.close()
     finally:
+        if "executor" in locals():
+            executor.shutdown(wait=False, cancel_futures=True)
         if output_file is not None:
             output_file.close()
 
-    print(f"\nCompleted: {completed}/{total_tasks} ({failed} errors)")
+    print(
+        f"\nCompleted: {completed}/{total_tasks} "
+        f"({failed} errors, {timed_out} timeouts)"
+    )
     if output_path is not None:
         print(f"Stream-saved {written} results to {output_path}")
 
@@ -1698,6 +1915,7 @@ def run_evaluation_only(
     completed_resume_keys: Set[str] = set()
     if resume:
         completed_resume_keys = _load_completed_resume_keys(output_path)
+        _compact_resume_output(output_path)
 
     pending_records = [
         record
@@ -1719,14 +1937,22 @@ def run_evaluation_only(
     results: List[Optional[BenchmarkResult]] = [None] * total_tasks
     completed = 0
     failed = 0
+    timed_out = 0
     written = 0
     next_to_write = 0
     finished: List[bool] = [False] * total_tasks
+    task_deadlines: List[Optional[float]] = [None] * total_tasks
     judge_semaphore: Optional[threading.Semaphore] = None
     eval_client: Optional[OpenAI] = None
     if eval_config is not None and eval_config.mode != "rule_only":
         judge_semaphore = threading.Semaphore(max(1, eval_config.concurrency))
         eval_client = eval_config.get_client()
+    evaluation_mode = eval_config.mode if eval_config is not None else "rule_only"
+    ordered_write_timeout_seconds = (
+        eval_config.timeout_seconds
+        if eval_config is not None
+        else DEFAULT_EVAL_TIMEOUT_SECONDS
+    )
 
     output_file = None
     if output_path is not None:
@@ -1738,25 +1964,34 @@ def run_evaluation_only(
         if total_tasks == 0:
             print("No pending responses. Nothing to evaluate.")
             return []
+        executor = ThreadPoolExecutor(max_workers=concurrency)
+        futures: Dict[Any, int] = {}
+        future_by_idx: Dict[int, Any] = {}
 
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures: Dict[Any, int] = {}
-            for idx, record in enumerate(pending_records):
-                future = executor.submit(
-                    _evaluate_existing_record,
-                    record,
-                    eval_config,
-                    eval_client,
-                    judge_semaphore,
-                )
-                futures[future] = idx
+        for idx, record in enumerate(pending_records):
+            future = executor.submit(
+                _evaluate_existing_record,
+                record,
+                eval_config,
+                eval_client,
+                judge_semaphore,
+            )
+            futures[future] = idx
+            future_by_idx[idx] = future
+        pending_futures = set(futures.keys())
+        pbar = tqdm(total=total_tasks, desc="Evaluating") if progress else None
 
-            iterator = as_completed(futures)
-            if progress:
-                iterator = tqdm(iterator, total=total_tasks, desc="Evaluating")
+        while pending_futures:
+            done, pending_futures = wait(
+                pending_futures,
+                timeout=0.5,
+                return_when=FIRST_COMPLETED,
+            )
 
-            for future in iterator:
+            for future in done:
                 idx = futures[future]
+                if finished[idx]:
+                    continue
                 try:
                     results[idx] = future.result()
                     completed += 1
@@ -1765,29 +2000,84 @@ def run_evaluation_only(
                     print(f"\nError evaluating existing response: {e}")
                 finally:
                     finished[idx] = True
-                    if output_file is not None:
-                        while next_to_write < total_tasks and finished[next_to_write]:
-                            pending_result = results[next_to_write]
-                            if pending_result is not None:
-                                output_file.write(
-                                    json.dumps(pending_result.to_jsonl_dict()) + "\n"
-                                )
-                                output_file.flush()
-                                written += 1
-                            next_to_write += 1
+                    if pbar is not None:
+                        pbar.update(1)
 
-                if on_progress and total_tasks > 0:
-                    pct = int((completed + failed) * 100 / total_tasks)
-                    on_progress(
-                        pct,
-                        "Evaluating",
-                        f"{completed + failed}/{total_tasks} responses processed ({failed} errors)",
-                    )
+            if output_file is not None:
+                now = time.time()
+                while next_to_write < total_tasks:
+                    if finished[next_to_write]:
+                        task_deadlines[next_to_write] = None
+                        pending_result = results[next_to_write]
+                        if pending_result is None:
+                            pending_result = _build_timeout_placeholder_for_existing_record(
+                                pending_records[next_to_write],
+                                evaluation_mode,
+                            )
+                            results[next_to_write] = pending_result
+                        output_file.write(
+                            json.dumps(pending_result.to_jsonl_dict()) + "\n"
+                        )
+                        output_file.flush()
+                        written += 1
+                        next_to_write += 1
+                        continue
+
+                    if task_deadlines[next_to_write] is None:
+                        task_deadlines[next_to_write] = (
+                            now
+                            + ordered_write_timeout_seconds
+                            + ORDERED_WRITE_STALL_GRACE_SECONDS
+                        )
+                        break
+
+                    if now >= task_deadlines[next_to_write]:
+                        timeout_result = _build_timeout_placeholder_for_existing_record(
+                            pending_records[next_to_write],
+                            evaluation_mode,
+                        )
+                        results[next_to_write] = timeout_result
+                        finished[next_to_write] = True
+                        timed_out += 1
+
+                        timeout_future = future_by_idx.get(next_to_write)
+                        if timeout_future is not None:
+                            pending_futures.discard(timeout_future)
+
+                        if pbar is not None:
+                            pbar.update(1)
+
+                        output_file.write(
+                            json.dumps(timeout_result.to_jsonl_dict()) + "\n"
+                        )
+                        output_file.flush()
+                        written += 1
+                        next_to_write += 1
+                        continue
+
+                    break
+
+            if on_progress and total_tasks > 0:
+                pct = int((completed + failed + timed_out) * 100 / total_tasks)
+                on_progress(
+                    pct,
+                    "Evaluating",
+                    f"{completed + failed + timed_out}/{total_tasks} responses processed "
+                    f"({failed} errors, {timed_out} timeouts)",
+                )
+
+        if pbar is not None:
+            pbar.close()
     finally:
+        if "executor" in locals():
+            executor.shutdown(wait=False, cancel_futures=True)
         if output_file is not None:
             output_file.close()
 
-    print(f"\nCompleted: {completed}/{total_tasks} ({failed} errors)")
+    print(
+        f"\nCompleted: {completed}/{total_tasks} "
+        f"({failed} errors, {timed_out} timeouts)"
+    )
     if output_path is not None:
         print(f"Stream-saved {written} results to {output_path}")
     ordered_results = [r for r in results if r is not None]
@@ -2221,8 +2511,8 @@ After benchmarking, train directly (category is preserved from input):
         "--eval-mode",
         type=str,
         default="rule_only",
-        choices=["rule_only", "judge_only", "hybrid"],
-        help="Evaluation mode: rule_only, judge_only, hybrid (default: rule_only)",
+        choices=["rule_only", "judge_only", "hybrid", "judge_review"],
+        help="Evaluation mode: rule_only, judge_only, hybrid, judge_review (default: rule_only)",
     )
     parser.add_argument(
         "--eval-trigger",
@@ -2259,8 +2549,8 @@ After benchmarking, train directly (category is preserved from input):
     parser.add_argument(
         "--eval-timeout-seconds",
         type=int,
-        default=300,
-        help="Judge request timeout in seconds (default: 300)",
+        default=DEFAULT_EVAL_TIMEOUT_SECONDS,
+        help="Judge request timeout in seconds (default: 60)",
     )
     parser.add_argument(
         "--eval-concurrency",
@@ -2331,7 +2621,10 @@ After benchmarking, train directly (category is preserved from input):
     eval_config: Optional[EvalConfig] = None
     if args.eval_mode != "rule_only":
         if not args.eval_model:
-            print("Error: --eval-model is required when --eval-mode is judge_only or hybrid")
+            print(
+                "Error: --eval-model is required when --eval-mode is "
+                "judge_only, hybrid, or judge_review"
+            )
             sys.exit(1)
         if args.eval_trigger == "uncertain" and (
             args.eval_uncertain_low >= args.eval_uncertain_high
