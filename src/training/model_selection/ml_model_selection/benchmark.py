@@ -2465,7 +2465,7 @@ After benchmarking, train directly (category is preserved from input):
         "--concurrency",
         type=int,
         default=4,
-        help="Number of concurrent requests (default: 4)",
+        help="Global concurrency limit for evaluation workers and judge requests (default: 4)",
     )
     parser.add_argument(
         "--no-progress",
@@ -2553,12 +2553,6 @@ After benchmarking, train directly (category is preserved from input):
         help="Judge request timeout in seconds (default: 60)",
     )
     parser.add_argument(
-        "--eval-concurrency",
-        type=int,
-        default=2,
-        help="Judge concurrency limit (default: 2)",
-    )
-    parser.add_argument(
         "--eval-max-retries",
         type=int,
         default=1,
@@ -2641,7 +2635,7 @@ After benchmarking, train directly (category is preserved from input):
             api_key=args.eval_api_key or args.api_key,
             temperature=args.eval_temperature,
             timeout_seconds=max(1, args.eval_timeout_seconds),
-            concurrency=max(1, args.eval_concurrency),
+            concurrency=max(1, args.concurrency),
             max_retries=max(0, args.eval_max_retries),
             hard_fail=args.eval_hard_fail,
             mode=args.eval_mode,
