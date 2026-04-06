@@ -75,6 +75,7 @@ class ModelConfig:
     max_tokens: int = 1024
     temperature: float = 0.0
     enable_thinking: Optional[bool] = None
+    enable_thinking_budget: Optional[int] = None
     enable_thinking_format: str = ENABLE_THINKING_FORMAT_DIRECT
 
     def get_client(self) -> OpenAI:
@@ -123,6 +124,7 @@ def load_model_configs(config_path: Path) -> List[ModelConfig]:
             max_tokens=model_data.get("max_tokens", 1024),
             temperature=model_data.get("temperature", 0.0),
             enable_thinking=model_data.get("enable_thinking"),
+            enable_thinking_budget=model_data.get("thinking_budget"),
             enable_thinking_format=_normalize_enable_thinking_format(
                 model_data.get("enable_thinking_format"),
                 f"model '{model_data['name']}'",
@@ -140,6 +142,7 @@ def create_model_configs_from_list(
     max_tokens: int = 1024,
     temperature: float = 0.0,
     enable_thinking: Optional[bool] = None,
+    enable_thinking_budget: Optional[int] = None,
     enable_thinking_format: str = ENABLE_THINKING_FORMAT_DIRECT,
 ) -> List[ModelConfig]:
     return [
@@ -150,6 +153,7 @@ def create_model_configs_from_list(
             max_tokens=max_tokens,
             temperature=temperature,
             enable_thinking=enable_thinking,
+            enable_thinking_budget=enable_thinking_budget,
             enable_thinking_format=enable_thinking_format,
         )
         for model in models
@@ -897,15 +901,23 @@ def benchmark_query(
                 model_config.enable_thinking_format
                 == ENABLE_THINKING_FORMAT_CHAT_TEMPLATE_KWARGS
             ):
-                request_kwargs["extra_body"] = {
-                    "chat_template_kwargs": {
-                        "enable_thinking": model_config.enable_thinking
-                    }
-                }
-            else:
-                request_kwargs["extra_body"] = {
+                chat_template_kwargs = {
                     "enable_thinking": model_config.enable_thinking
                 }
+                if model_config.enable_thinking_budget is not None:
+                    chat_template_kwargs["thinking_budget"] = (
+                        model_config.enable_thinking_budget
+                    )
+                request_kwargs["extra_body"] = {
+                    "chat_template_kwargs": chat_template_kwargs
+                }
+            else:
+                extra_body = {"enable_thinking": model_config.enable_thinking}
+                if model_config.enable_thinking_budget is not None:
+                    extra_body["thinking_budget"] = (
+                        model_config.enable_thinking_budget
+                    )
+                request_kwargs["extra_body"] = extra_body
 
         response = client.chat.completions.create(**request_kwargs)
         response_text = response.choices[0].message.content or ""
@@ -1155,6 +1167,7 @@ def run_benchmark_pipeline(
     max_tokens: int = 1024,
     temperature: float = 0.0,
     enable_thinking: Optional[bool] = None,
+    enable_thinking_budget: Optional[int] = None,
     enable_thinking_format: Optional[str] = None,
     concise: bool = False,
     limit: int = 0,
@@ -1200,6 +1213,8 @@ def run_benchmark_pipeline(
             model_config.temperature = temperature
             if enable_thinking is not None:
                 model_config.enable_thinking = enable_thinking
+            if enable_thinking_budget is not None:
+                model_config.enable_thinking_budget = enable_thinking_budget
             if normalized_enable_thinking_format is not None:
                 model_config.enable_thinking_format = normalized_enable_thinking_format
         print(f"Loaded {len(model_configs)} model configurations from {config_path}")
@@ -1211,6 +1226,7 @@ def run_benchmark_pipeline(
             max_tokens=max_tokens,
             temperature=temperature,
             enable_thinking=enable_thinking,
+            enable_thinking_budget=enable_thinking_budget,
             enable_thinking_format=(
                 normalized_enable_thinking_format or ENABLE_THINKING_FORMAT_DIRECT
             ),
@@ -1338,6 +1354,12 @@ Examples:
         help="Set enable_thinking value (true/false). When provided, --enable-thinking-format is required.",
     )
     parser.add_argument(
+        "--enable-thinking-budget",
+        type=int,
+        default=None,
+        help="Optional thinking_budget value to send alongside --enable-thinking.",
+    )
+    parser.add_argument(
         "--enable-thinking-format",
         type=str,
         choices=sorted(ENABLE_THINKING_FORMAT_CHOICES),
@@ -1374,6 +1396,13 @@ Examples:
             "--enable-thinking requires --enable-thinking-format "
             "(direct or chat_template_kwargs)"
         )
+    if args.enable_thinking is None and args.enable_thinking_budget is not None:
+        parser.error(
+            "--enable-thinking-budget requires --enable-thinking because "
+            "thinking_budget is only sent when enable_thinking is explicitly set"
+        )
+    if args.enable_thinking_budget is not None and args.enable_thinking_budget < 0:
+        parser.error("--enable-thinking-budget must be >= 0")
 
     queries_abs = Path(args.queries).expanduser().resolve()
     output_abs = Path(args.output).expanduser().resolve()
@@ -1400,6 +1429,7 @@ Examples:
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             enable_thinking=args.enable_thinking,
+            enable_thinking_budget=args.enable_thinking_budget,
             enable_thinking_format=args.enable_thinking_format,
             concise=args.concise,
             limit=args.limit or 0,
