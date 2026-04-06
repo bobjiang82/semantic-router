@@ -234,7 +234,7 @@ def format_concise_query(
     if metric == "code_eval":
         return (
             "Write code to solve this problem. Output ONLY the code, no "
-            f"explanations:\n\n{query}"
+            f"explanations:\n\n{query}\n\nAsserts for verification: {choices}"
         )
 
     if metric == "commongen_coverage":
