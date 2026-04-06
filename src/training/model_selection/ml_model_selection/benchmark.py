@@ -63,6 +63,7 @@ import sys
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -92,7 +93,7 @@ ENABLE_THINKING_FORMAT_CHOICES = {
     ENABLE_THINKING_FORMAT_DIRECT,
     ENABLE_THINKING_FORMAT_CHAT_TEMPLATE_KWARGS,
 }
-DEFAULT_EVAL_TIMEOUT_SECONDS = 60
+DEFAULT_EVAL_TIMEOUT_SECONDS = 120
 ORDERED_WRITE_STALL_GRACE_SECONDS = 5
 JUDGE_TIMEOUT_PLACEHOLDER_REASON = "llm judge timeout"
 
@@ -1354,21 +1355,20 @@ def _evaluate_with_judge(
 
     for attempt in range(attempts):
         try:
-            if judge_semaphore is not None:
-                with judge_semaphore:
-                    judge_resp = eval_client.chat.completions.create(
-                        model=eval_config.model,
-                        messages=[{"role": "user", "content": prompt}],
-                        max_tokens=256,
-                        temperature=eval_config.temperature,
-                    )
-            else:
-                judge_resp = eval_client.chat.completions.create(
-                    model=eval_config.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=256,
-                    temperature=eval_config.temperature,
-                )
+            request_kwargs: Dict[str, Any] = {
+                "model": eval_config.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 256,
+                "temperature": eval_config.temperature,
+                "extra_body": {
+                    "enable_thinking": True,
+                    "thinking_budget": 4096,
+                },
+            }
+
+            judge_context = judge_semaphore if judge_semaphore is not None else nullcontext()
+            with judge_context:
+                judge_resp = eval_client.chat.completions.create(**request_kwargs)
 
             judge_text = judge_resp.choices[0].message.content or ""
             judge_score, parse_meta = _parse_judge_result(judge_text)
@@ -2550,7 +2550,7 @@ After benchmarking, train directly (category is preserved from input):
         "--eval-timeout-seconds",
         type=int,
         default=DEFAULT_EVAL_TIMEOUT_SECONDS,
-        help="Judge request timeout in seconds (default: 60)",
+        help="Judge request timeout in seconds (default: 120)",
     )
     parser.add_argument(
         "--eval-max-retries",
