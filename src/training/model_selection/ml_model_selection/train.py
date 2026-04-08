@@ -13,6 +13,7 @@ Reference:
 """
 
 import argparse
+import json
 import os
 import time
 from pathlib import Path
@@ -81,6 +82,33 @@ def create_training_samples(
         )
 
     return samples
+
+
+def select_best_record_per_query(
+    records: List[RoutingRecord],
+    quality_weight: float = 0.9,
+) -> List[RoutingRecord]:
+    """Keep only the best record for each query.
+
+    The best record is chosen by the same combined score used elsewhere in the
+    training stack: quality_weight * quality + (1-quality_weight) * speed_factor.
+    """
+    if not records:
+        return []
+
+    best_records: Dict[str, RoutingRecord] = {}
+    best_scores: Dict[str, float] = {}
+
+    for record in records:
+        speed_factor = 1.0 / (1.0 + record.latency_ms / 10000.0)
+        score = quality_weight * record.quality + (1 - quality_weight) * speed_factor
+
+        prev_score = best_scores.get(record.query)
+        if prev_score is None or score > prev_score:
+            best_scores[record.query] = score
+            best_records[record.query] = record
+
+    return list(best_records.values())
 
 
 def train_models(
@@ -222,6 +250,7 @@ def run_training_pipeline(
     mlp_dropout: float = 0.1,
     skip_mlp: bool = False,
     algorithm: str = "all",
+    best_per_query: bool = False,
     on_progress=None,
 ) -> List[str]:
     """
@@ -248,6 +277,7 @@ def run_training_pipeline(
         mlp_dropout: Dropout rate for MLP.
         skip_mlp: Skip MLP training.
         algorithm: Which algorithm to train (all, knn, kmeans, svm, mlp).
+        best_per_query: Keep only the best model row for each query.
         on_progress: Optional callback(percent, step, message) for progress.
 
     Returns:
@@ -271,6 +301,29 @@ def run_training_pipeline(
         data_path = download_data(cache_dir)
 
     records = load_jsonl(data_path)
+
+    if best_per_query:
+        original_count = len(records)
+        records = select_best_record_per_query(records, quality_weight=quality_weight)
+        print(
+            "  Best-per-query filter enabled: "
+            f"{original_count} -> {len(records)} records"
+        )
+        # Save filtered records alongside the input file
+        bpq_path = data_path.parent / (data_path.stem + "_bestperquery" + data_path.suffix)
+        with open(bpq_path, "w", encoding="utf-8") as bpq_f:
+            for r in records:
+                bpq_f.write(
+                    json.dumps({
+                        "query": r.query,
+                        "category": r.category,
+                        "model_name": r.model_name,
+                        "performance": r.quality,
+                        "response_time": r.latency_ms / 1000.0,
+                    }) + "\n"
+                )
+        print(f"  Saved filtered records to {bpq_path}")
+
     print_data_stats(records)
 
     # Step 2: Generate embeddings
@@ -455,6 +508,11 @@ Examples:
         choices=["all", "knn", "kmeans", "svm", "mlp"],
         help="Train specific algorithm: all, knn, kmeans, svm, mlp (default: all)",
     )
+    parser.add_argument(
+        "--best-per-query",
+        action="store_true",
+        help="Keep only the best model row per query before training",
+    )
 
     args = parser.parse_args()
 
@@ -471,6 +529,7 @@ Examples:
     print(f"  KMeans clusters:  {args.kmeans_clusters}")
     print(f"  SVM kernel:       {args.svm_kernel} (gamma={args.svm_gamma})")
     print(f"  Algorithm:        {args.algorithm}")
+    print(f"  Best per query:   {args.best_per_query}")
     if args.algorithm in ["all", "mlp"]:
         if TORCH_AVAILABLE and not args.skip_mlp:
             print(f"  MLP hidden:       {mlp_hidden_sizes}")
@@ -501,6 +560,7 @@ Examples:
         mlp_dropout=args.mlp_dropout,
         skip_mlp=args.skip_mlp,
         algorithm=args.algorithm,
+        best_per_query=args.best_per_query,
     )
 
 
